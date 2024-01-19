@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+# 
+# Simple virsh / virt-install / virt-clone / virt-sysprep wrapper
+# allowing to kickstart RHEL guest as templates which can be used
+# for quicly spinning up new VMs by doing a clone + sysprep
+
+
+import argparse
+import sys
+import re
+import os.path
+import os
+import subprocess
+import uuid
+
+
+class vmctl:
+    ks_info = { 6: { "iso": "rhel-server-%s.%s-x86_64-dvd.iso",
+                          "ks":  "rhel-server-6-x86_64.cfg" }, 
+                     7: { "iso": "rhel-server-%s.%s-x86_64-dvd.iso",
+                          "ks":  "rhel-server-7-x86_64.cfg" },
+                     8: { "iso": "rhel-%s.%s-x86_64-dvd.iso",
+                          "ks":  "rhel-8-x86_64.cfg" },
+                     9: { "iso": "rhel-baseos-%s.%s-x86_64-dvd.iso",
+                          "ks":  "rhel-9-x86_64.cfg" } }
+    image_path =  "/var/lib/libvirt/images"
+    ks_path = os.path.dirname(sys.argv[0]) + "/../kickstart"
+    error="None"
+
+
+    def __init__(self, release):
+        self.release=release
+
+    def prepare_kickstart(self, name, mem, cpus):
+        print("Preparing kickstart...")
+        self.verify_release()
+        self.kickstart_iso = self.image_path + "/" + self.ks_info[self.major]["iso"] % (self.major, self.minor)
+        self.kickstart_ks = self.ks_path + "/" + self.ks_info[self.major]["ks"]
+        if not os.path.exists(self.kickstart_iso):
+            print(f"ISO image does not exist or not accessible: {self.kickstart_iso}")
+            sys.exit(4)
+        self.kickstart_ks = self.ks_path + "/" + self.ks_info[self.major]["ks"]
+        if not os.path.exists(self.kickstart_ks):
+            print(f"Kickstart file does not exist or not accessible: {self.kickstart_ks}")
+            sys.exit(5)
+        self.vmname = name
+        self.kickstart_mem = mem
+        self.kickstart_cpus = cpus
+        self.virt_install = f"""sudo /usr/bin/virt-install \
+            --virt-type kvm \
+            --name {self.vmname} \
+            --memory {self.kickstart_mem * 1024} \
+            --vcpus {self.kickstart_cpus} \
+            --location={self.kickstart_iso} \
+            --os-variant rhel{self.major}.{self.minor} \
+            --disk size=10,bus=virtio,pool=default \
+            --network default \
+            --extra-arg "console=tty0 console=ttyS0,115200n8 inst.ks=file:/{os.path.basename(self.kickstart_ks)} text hostname={self.vmname}" \
+            --initrd-inject={self.kickstart_ks} \
+            --serial pty \
+            --graphics vnc \
+            --graphics spice \
+            --noreboot \
+            --noautoconsole \
+            --wait -1 2>&1"""
+
+
+    def do_kickstart(self):
+        print("Kickstarting new template VM...")
+        cmd = self.virt_install
+        p1 = subprocess.Popen(cmd, shell=True)
+        p1.wait()
+        if p1.returncode == 0:
+            print("Kickstart completed!")
+        else:
+            print("Kickstart failed, exiting!")
+            sys.exit(6)
+
+        print("Adding RHEL ISO file to template permanently...")
+        cmd = f"sudo /usr/bin/virsh change-media {self.vmname} sda --source={self.kickstart_iso} --config"
+        p2 = subprocess.Popen(cmd, shell=True)
+        p2.wait()
+        if p2.returncode == 0:
+            print("RHEL ISO added.")
+        else:
+            sys.exit(7)
+
+
+        print("Sparsifying disk image to temporary file...")
+        tmpname=str(uuid.uuid4())
+        cmd = f"sudo /usr/bin/virt-sparsify --tmp {self.image_path} {self.image_path}/{self.vmname}.qcow2 {self.image_path}/{self.vmname}-{tmpname}.qcow2"
+        p3 = subprocess.Popen(cmd, shell=True)
+        p3.wait()
+        if p3.returncode == 0:
+            print("Sparifying completed!")
+        else:
+            sys.exit(8)
+
+        print("Moving sparsified disk in place...")
+        cmd = f"sudo /usr/bin/mv {self.image_path}/{self.vmname}-{tmpname}.qcow2 {self.image_path}/{self.vmname}.qcow2"
+        p4 = subprocess.Popen(cmd, shell=True)
+        p4.wait()
+        if p4.returncode == 0:
+            print("Disk image moved!")
+        else:
+            sys.exit(9)
+        print("Kickstart competed!")
+
+
+    def prepare_clone(self, name):
+        print("Preparing kickstart...")
+        self.verify_release()
+        self.template_name = f"rhel{self.major}{self.minor}base"
+        self.template_img = f"{self.image_path}/{self.template_name}.qcow2"
+        self.vmname = name
+        if not os.path.exists(self.template_img):
+            print(f"Template does not exist. Missing img file: {self.template_img}")
+            sys.exit(10)
+        self.virt_clone = f"sudo /usr/bin/virt-clone -o {self.template_name} --name {self.vmname} --file {self.image_path}/{self.vmname}.qcow2"
+        for pkf in [ "id_dsa.pub", "id_ecdsa.pub", "id_ecdsa_sk.pub", "id_ed25519.pub", "id_ed25519_sk.pub" ]:
+            if os.path.exists(os.environ['HOME'] + f"/.ssh/{pkf}"):
+                self.pubkeyfile = os.environ['HOME'] + f"/.ssh/{pkf}"
+                break
+        if not self.pubkeyfile:
+            print(f"No ssh pub key file found to inject into clone for root and user1!")
+            sys.exit(11)
+        self.virt_sysprep = f"sudo /usr/bin/virt-sysprep -d {self.vmname} --hostname {self.vmname} --selinux-relabel " + \
+            f"--ssh-inject root:file:{self.pubkeyfile} --ssh-inject user1:file:{self.pubkeyfile}"
+        # Fixing DHCP hostname is only need on RHEL6)
+        if self.major == 6:
+                  self.virt_sysprep += " --firstboot " + os.environ['HOME'] + "/.local/kickstart/fixdhcp.sh"
+
+
+    def do_clone(self):
+        print("Cloning template to new VM...")
+        cmd = self.virt_clone
+        p1 = subprocess.Popen(cmd, shell=True)
+        p1.wait()
+        if p1.returncode == 0:
+            print("Clone completed!!")
+        else:
+            print("Clone failed, exiting!")
+            sys.exit(12)
+        print("Running virt-sysprep on new VM...")
+        cmd = self.virt_sysprep
+        p2 = subprocess.Popen(cmd, shell=True)
+        p2.wait()
+        if p2.returncode == 0:
+            print("Sysprep completed!!")
+        else:
+            print("Sysprep failed, exiting!")
+            sys.exit(13)
+        print("Starting new VM...")
+        cmd = f"sudo /usr/bin/virsh start {self.vmname}"
+        p3 = subprocess.Popen(cmd, shell=True)
+        p3.wait()
+        if p3.returncode == 0:
+            print("New vm started!")
+        else:
+            print("Start failed, exiting!")
+            sys.exit(14)
+
+
+
+
+    def verify_release(self):
+        if re.match("\d\.\d{1,2}$", self.release):
+            self.major = int(self.release.split(".")[0])
+            self.minor = int(self.release.split(".")[1])
+        else:
+            print("Invalid release, must be in x.y format!")
+            sys.exit(1)
+        if self.major not in range(6,10):
+            print("Unsupported major release (supporting RHEL 6, 7, 8 and 9)")
+            sys.exit(2)
+        if self.minor not in range(0,11):
+            print("Unsupported minor release (supporting .0 - .10!)")
+            sys.exit(3)
+
+
+def kickstart(args):
+    newtemplate = vmctl(release=args.release)
+    newtemplate.prepare_kickstart(name=args.name, mem=args.memory, cpus=args.cpus)
+    newtemplate.do_kickstart()
+
+
+
+def clone(args):
+    newvm = vmctl(release=args.release)
+    newvm.prepare_clone(name=args.name)
+    newvm.do_clone()
+
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Manage VM creating and cloning of RHEL guest on this hypervisor")
+    subparsers = parser.add_subparsers(help='sub-command help')
+    parser_kickstart = subparsers.add_parser('kickstart', help='Create a new template VM')
+    parser_kickstart.add_argument('-r', '--release', type=str, metavar='', help='RHEL release including minor version (i.e. 8.6)')
+    parser_kickstart.add_argument('-m', '--memory', type=int, metavar='', \
+            default=1, choices=range(1,5), \
+            help='memory config of the template in GB, default 1GB, max 4GB')
+    parser_kickstart.add_argument('-n', '--name', type=str, metavar='', help='Name of the new template VM')
+    parser_kickstart.add_argument('-c', '--cpus', type=int, metavar='', \
+            default=1, choices=range(1,5), \
+            help='Number of vCPUs of the template, default 1vCPU, max 4 vCPUs')
+    parser_kickstart.set_defaults(func=kickstart)
+
+    parser_clone = subparsers.add_parser('clone', help='Create a new clone from template')
+    parser_clone.add_argument('-r', '--release', type=str, metavar='', help='RHEL release including minor version (i.e. 8.6)')
+    parser_clone.add_argument('-n', '--name', type=str, metavar='', help='Name of the new guest VM')
+    parser_clone.set_defaults(func=clone)
+
+    args = parser.parse_args()
+    args.func(args)

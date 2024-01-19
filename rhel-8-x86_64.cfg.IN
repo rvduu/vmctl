@@ -1,0 +1,91 @@
+#version=RHEL8
+ignoredisk --only-use=vda
+autopart --type=lvm
+# Partition clearing information
+clearpart --none --initlabel
+# Use text install
+text
+repo --name="AppStream" --baseurl=file:///run/install/repo/AppStream
+# Use CDROM installation media
+cdrom
+# Keyboard layouts
+keyboard --vckeymap=us --xlayouts='us'
+# System language
+lang en_US.UTF-8
+# Network information
+network  --bootproto=dhcp --device=enp1s0 --ipv6=auto --activate
+%include /tmp/network-include
+# Root password
+rootpw --iscrypted __PASSWORD__
+# Run the Setup Agent on first boot
+firstboot --disable
+# Do not configure the X Window System
+skipx
+# System services
+services --enabled="chronyd"
+# Intended system purpose
+syspurpose --role="Red Hat Enterprise Linux Server" --sla="Self Support" --usage="Development/Test"
+# System timezone
+timezone Europe/Amsterdam --isUtc
+user --groups=wheel --name=user1 --password=__PASSWORD__  --iscrypted --gecos="User 1"
+reboot
+
+%packages
+@^minimal-environment
+kexec-tools
+
+%end
+
+%pre
+> /tmp/network-include
+if grep -q 'hostname=.*' /proc/cmdline
+then
+	for i in $(cat /proc/cmdline)
+	do
+		if echo $i | grep -q '^hostname='
+		then
+			eval $i
+		fi
+	done
+	echo "network  --hostname=${hostname}.example.com" > /tmp/network-include
+fi
+%end
+
+%addon com_redhat_kdump --enable --reserve-mb='auto'
+
+%end
+
+%anaconda
+pwpolicy root --minlen=6 --minquality=1 --notstrict --nochanges --notempty
+pwpolicy user --minlen=6 --minquality=1 --notstrict --nochanges --emptyok
+pwpolicy luks --minlen=6 --minquality=1 --notstrict --nochanges --notempty
+%end
+
+# Post installation config
+%post --log=/root/ks-post.log
+
+# YUM config
+mkdir /cdrom
+echo "/dev/cdrom                /cdrom                  iso9660 ro,loop         0 0" >> /etc/fstab
+echo "[rhel-baseos-dvd]
+name=Red Hat Enterprise Linux \$releasever for \$basearch - BaseOS (RPMs)
+baseurl=file:///cdrom/BaseOS
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+
+[rhel-appstream-dvd]
+name=Red Hat Enterprise Linux \$releasever for \$basearch - AppStream (RPMs)
+baseurl=file:///cdrom/AppStream
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+" > /etc/yum.repos.d/rhel-dvd.repo
+rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+
+# SSH public key(s)
+mkdir -m 0700 /root/.ssh
+echo "__SSHPUBKEY__" > /root/.ssh/authorized_keys
+chmod 0600 /root/.ssh/authorized_keys
+restorecon -R /root/.ssh
+%end

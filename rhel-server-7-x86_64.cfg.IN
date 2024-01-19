@@ -1,0 +1,64 @@
+#version=RHEL7
+
+
+cdrom
+lang en_US.UTF-8
+keyboard us
+timezone Europe/Amsterdam --isUtc
+network  --bootproto=dhcp --device=eth0 --ipv6=auto --activate
+%include /tmp/network-include
+reboot
+text
+clearpart --all --initlabel --drives=vda
+autopart --type=lvm
+bootloader --location=mbr --boot-drive=vda
+auth --enableshadow --passalgo=sha512
+rootpw --iscrypted __PASSWORD__
+selinux --enforcing
+firewall --enabled --ssh
+skipx
+firstboot --disable
+user --groups=wheel --name=user1 --password=__PASSWORD__  --iscrypted --gecos="User 1"
+
+
+
+%packages
+@core
+%end
+
+%pre
+> /tmp/network-include
+if grep -q 'hostname=.*' /proc/cmdline
+then
+	for i in $(cat /proc/cmdline)
+	do
+		if echo $i | grep -q '^hostname='
+		then
+			eval $i
+		fi
+	done
+	echo "network  --hostname=${hostname}.example.com" > /tmp/network-include
+fi
+%end
+
+
+%post --log=/root/ks-post.log
+
+# YUM config
+mkdir /cdrom
+echo "/dev/cdrom		/cdrom			iso9660	ro,loop		0 0" >> /etc/fstab
+echo "[rhel-dvd]
+name=Red Hat Enterprise Linux $releasever - $basearch
+baseurl=file:///cdrom
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+" > /etc/yum.repos.d/rhel-dvd.repo
+rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+
+# SSH public key(s)
+mkdir -m 0700 /root/.ssh
+echo "__SSHPUBKEY__" > /root/.ssh/authorized_keys
+chmod 0600 /root/.ssh/authorized_keys
+restorecon -R /root/.ssh
+%end
